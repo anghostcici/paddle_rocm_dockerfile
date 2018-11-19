@@ -117,7 +117,9 @@ COPY patch_conv_cache.txt /root
 #COPY 0001-Add-cache.patch /root
 #COPY 0002-Add-group-conv-support.patch /root
 
-RUN cd ~/ && git clone https://sabreshao:dladmin123456@github.com/AMDComputeLibraries/MLOpen -b 1.6.x && cd ~/MLOpen && \
+ARG user
+ARG pwd
+RUN cd ~/ && git clone https://${user}:${pwd}@github.com/AMDComputeLibraries/MLOpen -b 1.6.x && cd ~/MLOpen && \
     git apply ../patch_conv_cache.txt && \
     mkdir -p build && cd build && \
     PATH=/opt/rh/devtoolset-7/root/usr/bin${PATH:+:${PATH}} CXX=/opt/rocm/hcc/bin/hcc cmake \
