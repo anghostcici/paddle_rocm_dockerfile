@@ -119,7 +119,9 @@ COPY patch_miopen_inclusive_avg_pooling.txt /root
 #COPY 0001-Add-cache.patch /root
 #COPY 0002-Add-group-conv-support.patch /root
 
-RUN cd ~/ && git clone https://sabreshao:Emacs_98@github.com/AMDComputeLibraries/MLOpen -b 1.7.x && cd ~/MLOpen && \
+ARG user
+ARG pwd
+RUN cd ~/ && git clone https://${user}:${pwd}@github.com/AMDComputeLibraries/MLOpen -b 1.7.x && cd ~/MLOpen && \
     git apply ../0001-Cache.patch && git apply ../patch_miopen_inclusive_avg_pooling.txt && \
     mkdir -p build && cd build && \
     PATH=/opt/rh/devtoolset-7/root/usr/bin${PATH:+:${PATH}} CXX=/opt/rocm/hcc/bin/hcc cmake \

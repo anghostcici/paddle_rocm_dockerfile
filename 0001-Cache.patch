@@ -1,0 +1,334 @@
+From 5a5ffead1a5b6b3b0ecfb0f7a4f24679a927ad3d Mon Sep 17 00:00:00 2001
+From: sabreshao <sabre.shao@amd.com>
+Date: Sat, 22 Dec 2018 18:45:20 +0800
+Subject: [PATCH] Cache.
+
+---
+ src/convolution.cpp           | 87 +++++++++++++++++++++++++++++++++++--------
+ src/include/miopen/handle.hpp |  6 +++
+ src/ocl/convolutionocl.cpp    | 62 ++++++++++++++++++++++++++++++
+ 3 files changed, 140 insertions(+), 15 deletions(-)
+
+diff --git a/src/convolution.cpp b/src/convolution.cpp
+index 72b770c..b398de1 100644
+--- a/src/convolution.cpp
++++ b/src/convolution.cpp
+@@ -29,6 +29,7 @@
+ #include <miopen/errors.hpp>
+ 
+ MIOPEN_DECLARE_ENV_VAR(MIOPEN_DEBUG_CONV_DIRECT)
++MIOPEN_DECLARE_ENV_VAR(MIOPEN_ENABLE_CACHE_CONV_CONFIG)
+ 
+ namespace miopen {
+ 
+@@ -315,11 +316,25 @@ size_t ConvolutionDescriptor::ForwardGetWorkSpaceSize(Handle& handle,
+                                                       const TensorDescriptor& yDesc) const
+ {
+     MIOPEN_LOG_I2("");
++    std::string find_config;
++    size_t wsize = 0;
++ 
++    if(miopen::IsEnabled(MIOPEN_ENABLE_CACHE_CONV_CONFIG{}))
++    {
++        mlo_construct_direct2D find_params(xDesc, wDesc, yDesc, *this, 1);
++        find_params.mloBuildConf_Key(find_config);
++
++        auto iter = handle.fwd_size_map.find(find_config);
++        if(iter != handle.fwd_size_map.end())
++        {
++            return iter->second;
++        }
++    }
+     if(mode == miopenTranspose)
+ #if MIOPEN_USE_GEMM
+-        return BackwardDataGetWorkSpaceSizeGEMM(handle, wDesc, xDesc);
++        wsize = BackwardDataGetWorkSpaceSizeGEMM(handle, wDesc, xDesc);
+ #else
+-        return 0;
++        wsize = 0;
+ #endif
+     else
+     {
+@@ -342,21 +357,23 @@ size_t ConvolutionDescriptor::ForwardGetWorkSpaceSize(Handle& handle,
+         if((wei_h == 1 && wei_w == 1 && pad_h == 0 && pad_w == 0) &&
+            ((in_h <= 14 && in_w <= 14 && u == 1 && v == 1) || (u == 2 && v == 2)))
+         {
+-            return std::max(ForwardGetWorkSpaceSizeGEMMTranspose(xDesc, yDesc), direct_workspace);
++            wsize = std::max(ForwardGetWorkSpaceSizeGEMMTranspose(xDesc, yDesc), direct_workspace);
+         }
+-        if(dilation_w > 1 || dilation_h > 1)
+-            return std::max((groups * ForwardGetWorkSpaceSizeGEMM(handle, wDesc, yDesc)),
++        else if(dilation_w > 1 || dilation_h > 1)
++        {
++            wsize = std::max((groups * ForwardGetWorkSpaceSizeGEMM(handle, wDesc, yDesc)),
+                             direct_workspace);
++        }
+ #endif
+ 
+         // Check if Winograd is available
+         // If Winograd is present, there is no advantage in letting
+         // the user run another algorithm as those both slower and
+         // use more workspace.
+-        if(IsWinograd3x3Supported(handle, true, wDesc, xDesc) &&
++        else if(IsWinograd3x3Supported(handle, true, wDesc, xDesc) &&
+            !(mode == miopenGroupConv || mode == miopenDepthwise))
+         {
+-            return 0;
++            wsize = 0;
+         }
+         else
+         {
+@@ -368,9 +385,14 @@ size_t ConvolutionDescriptor::ForwardGetWorkSpaceSize(Handle& handle,
+ #endif
+             size_t workspace_size_fft = ForwardGetWorkSpaceSizeFFT(wDesc, xDesc, yDesc);
+ 
+-            return std::max(std::max(workspace_size_fft, workspace_size_gemm), direct_workspace);
++            wsize = std::max(std::max(workspace_size_fft, workspace_size_gemm), direct_workspace);
+         }
+     }
++
++    if(miopen::IsEnabled(MIOPEN_ENABLE_CACHE_CONV_CONFIG{}))
++        handle.fwd_size_map.insert(
++            std::unordered_map<std::string, size_t>::value_type(find_config, wsize));
++    return wsize;
+ }
+ 
+ size_t ConvolutionDescriptor::BackwardDataGetWorkSpaceSize(Handle& handle,
+@@ -379,11 +401,24 @@ size_t ConvolutionDescriptor::BackwardDataGetWorkSpaceSize(Handle& handle,
+                                                            const TensorDescriptor& dxDesc) const
+ {
+     MIOPEN_LOG_I2("");
++    size_t wsize = 0;
++    std::string find_config;
++
++    if(miopen::IsEnabled(MIOPEN_ENABLE_CACHE_CONV_CONFIG{}))
++    {
++        mlo_construct_direct2D find_params(dxDesc, wDesc, dyDesc, *this, 0); // backward
++        find_params.mloBuildConf_Key(find_config);
++        auto iter = handle.bwdData_size_map.find(find_config);
++        if(iter != handle.bwdData_size_map.end())
++        {
++            return iter->second;
++        }
++    }
+     if(mode == miopenTranspose)
+ #if MIOPEN_USE_GEMM
+-        return ForwardGetWorkSpaceSizeGEMM(handle, wDesc, dxDesc);
++        wsize = ForwardGetWorkSpaceSizeGEMM(handle, wDesc, dxDesc);
+ #else
+-        return 0;
++        wsize = 0;
+ #endif
+     else
+     {
+@@ -402,10 +437,10 @@ size_t ConvolutionDescriptor::BackwardDataGetWorkSpaceSize(Handle& handle,
+         if(wei_h == 1 && wei_w == 1 && pad_h == 0 && pad_w == 0 && (u == 2 && v == 2))
+         {
+             size_t gemm_trans = BackwardDataGetWorkSpaceSizeGEMMTranspose(dyDesc, dxDesc);
+-            return std::max(gemm_trans, direct_workspace);
++            wsize = std::max(gemm_trans, direct_workspace);
+         }
+-        if(dilation_w > 1 || dilation_h > 1)
+-            return std::max((groups * BackwardDataGetWorkSpaceSizeGEMM(handle, wDesc, dyDesc)),
++        else if(dilation_w > 1 || dilation_h > 1)
++            wsize = std::max((groups * BackwardDataGetWorkSpaceSizeGEMM(handle, wDesc, dyDesc)),
+                             direct_workspace);
+ #endif
+ 
+@@ -416,7 +451,7 @@ size_t ConvolutionDescriptor::BackwardDataGetWorkSpaceSize(Handle& handle,
+         if(IsWinograd3x3Supported(handle, false, wDesc, dyDesc) &&
+            !(mode == miopenGroupConv || mode == miopenDepthwise))
+         {
+-            return 0;
++            wsize = 0;
+         }
+         else
+         {
+@@ -426,9 +461,13 @@ size_t ConvolutionDescriptor::BackwardDataGetWorkSpaceSize(Handle& handle,
+ #endif
+             size_t workspace_size_fft = BackwardGetWorkSpaceSizeFFT(wDesc, dyDesc, dxDesc);
+ 
+-            return std::max(std::max(workspace_size_fft, workspace_size_gemm), direct_workspace);
++            wsize = std::max(std::max(workspace_size_fft, workspace_size_gemm), direct_workspace);
+         }
+     }
++    if(miopen::IsEnabled(MIOPEN_ENABLE_CACHE_CONV_CONFIG{}))
++        handle.bwdData_size_map.insert(
++            std::unordered_map<std::string, size_t>::value_type(find_config, wsize));
++    return wsize;
+ }
+ 
+ // weights_n = output_c
+@@ -682,12 +721,27 @@ size_t ConvolutionDescriptor::ConvolutionBackwardWeightsGetWorkSpaceSize(
+     const TensorDescriptor& dwDesc) const
+ {
+     MIOPEN_LOG_I2("");
++
+     int groups = 1;
+     if(mode == miopenDepthwise)
+         groups = xDesc.GetLengths()[1];
+     else if(mode == miopenGroupConv)
+         groups = group_count;
+ 
++    std::string find_config;
++    
++    if(miopen::IsEnabled(MIOPEN_ENABLE_CACHE_CONV_CONFIG{}))
++    {
++        mlo_construct_BwdWrW2D find_params(
++            xDesc, dwDesc, dyDesc, *this, 0); // backward with regards to weights
++        find_params.mloBuildConf_Key(find_config);
++        auto iter = handle.bwdWeights_size_map.find(find_config);
++        if(iter != handle.bwdWeights_size_map.end())
++        {
++            return iter->second;
++        }
++    }
++
+     size_t workspace_size = 0;
+     if(mode == miopenTranspose)
+     {
+@@ -707,6 +761,9 @@ size_t ConvolutionDescriptor::ConvolutionBackwardWeightsGetWorkSpaceSize(
+                      workspace_size_gemm);
+     }
+ 
++    if(miopen::IsEnabled(MIOPEN_ENABLE_CACHE_CONV_CONFIG{}))
++        handle.bwdWeights_size_map.insert(
++            std::unordered_map<std::string, size_t>::value_type(find_config, workspace_size));
+     return workspace_size;
+ }
+ 
+diff --git a/src/include/miopen/handle.hpp b/src/include/miopen/handle.hpp
+index bbc0527..7a4496c 100644
+--- a/src/include/miopen/handle.hpp
++++ b/src/include/miopen/handle.hpp
+@@ -181,6 +181,12 @@ struct Handle : miopenHandle
+ #if MIOPEN_USE_ROCBLAS
+     rocblas_handle_ptr rhandle;
+ #endif
++    std::unordered_map<std::string, int> fwd_map;
++    std::unordered_map<std::string, int> bwdData_map;
++    std::unordered_map<std::string, int> bwdWeights_map;
++    std::unordered_map<std::string, size_t> fwd_size_map;
++    std::unordered_map<std::string, size_t> bwdData_size_map;
++    std::unordered_map<std::string, size_t> bwdWeights_size_map;
+ };
+ } // namespace miopen
+ MIOPEN_DEFINE_OBJECT(miopenHandle, miopen::Handle);
+diff --git a/src/ocl/convolutionocl.cpp b/src/ocl/convolutionocl.cpp
+index 75b8bc4..ec44455 100644
+--- a/src/ocl/convolutionocl.cpp
++++ b/src/ocl/convolutionocl.cpp
+@@ -44,6 +44,7 @@ MIOPEN_DECLARE_ENV_VAR(MIOPEN_DEBUG_CONV_GEMM)
+ MIOPEN_DECLARE_ENV_VAR(MIOPEN_DEBUG_CONV_DIRECT)
+ MIOPEN_DECLARE_ENV_VAR(MIOPEN_DEBUG_ENABLE_FIND_DB)
+ MIOPEN_DECLARE_ENV_VAR(MIOPEN_CONV_PRECISE_ROCBLAS_TIMING)
++MIOPEN_DECLARE_ENV_VAR(MIOPEN_ENABLE_CACHE_CONV_CONFIG)
+ 
+ struct AutoEnableProfiling
+ {
+@@ -1067,6 +1068,22 @@ void ConvolutionDescriptor::FindConvFwdAlgorithm(Handle& handle,
+ 
+     ProblemDescription problem(xDesc, wDesc, yDesc, *this, 1);
+ 
++    std::string find_config;
++
++    if(miopen::IsEnabled(MIOPEN_ENABLE_CACHE_CONV_CONFIG{}) && requestAlgoCount == 1)
++    {
++      mlo_construct_direct2D find_params(xDesc, wDesc, yDesc, *this, 1); // forward
++      find_params.mloBuildConf_Key(find_config);
++
++      auto iter = handle.fwd_map.find(find_config);
++      if(iter != handle.fwd_map.end())
++      {
++        perfResults[0].fwd_algo = static_cast<miopenConvFwdAlgorithm_t>(iter->second);
++        *returnedAlgoCount      = 1;
++        return;
++      }
++    }
++
+     const auto find_db_path = GetFindDbPath() + "/" + handle.GetDbPathFilename() + ".cd.fdb.txt";
+     (void)find_db_path;
+     auto record =
+@@ -1138,6 +1155,10 @@ void ConvolutionDescriptor::FindConvFwdAlgorithm(Handle& handle,
+         perfResults[i].time   = perf_db[i].time;
+         perfResults[i].memory = perf_db[i].workspace;
+     }
++
++    if(miopen::IsEnabled(MIOPEN_ENABLE_CACHE_CONV_CONFIG{}))
++        handle.fwd_map.insert(std::unordered_map<std::string, int>::value_type(
++            find_config, FwdAlgoResolver(perf_db[0].name)));
+ }
+ 
+ void ConvolutionDescriptor::ConvolutionForward(Handle& handle,
+@@ -1854,6 +1875,22 @@ void ConvolutionDescriptor::FindConvBwdDataAlgorithm(Handle& handle,
+     if(requestAlgoCount < 1)
+         MIOPEN_THROW(miopenStatusBadParm, "requestAlgoCount cannot be < 1");
+ 
++    std::string find_config;
++
++    if(miopen::IsEnabled(MIOPEN_ENABLE_CACHE_CONV_CONFIG{}) && requestAlgoCount == 1)
++    {
++        mlo_construct_direct2D find_params(dxDesc, wDesc, dyDesc, *this, 0); // backward
++        find_params.mloBuildConf_Key(find_config);
++
++        auto iter = handle.bwdData_map.find(find_config);
++        if(iter != handle.bwdData_map.end())
++        {
++            perfResults[0].bwd_data_algo = static_cast<miopenConvBwdDataAlgorithm_t>(iter->second);
++            *returnedAlgoCount           = 1;
++            return;
++        }
++    }
++
+     *returnedAlgoCount = 0;
+ 
+     // create a dummy buffer for use as output for the kernel calls
+@@ -2593,6 +2630,10 @@ void ConvolutionDescriptor::FindConvBwdDataAlgorithm(Handle& handle,
+         perfResults[i].time   = perf_db[i].time;
+         perfResults[i].memory = perf_db[i].workspace;
+     }
++
++    if(miopen::IsEnabled(MIOPEN_ENABLE_CACHE_CONV_CONFIG{}))
++        handle.bwdData_map.insert(std::unordered_map<std::string, int>::value_type(
++            find_config, BwdDataAlgoResolver(perf_db[0].name)));
+ }
+ 
+ // BackwardDataAlgorithm()
+@@ -3379,6 +3420,24 @@ void ConvolutionDescriptor::FindConvBwdWeightsAlgorithm(Handle& handle,
+     if(requestAlgoCount < 1)
+         MIOPEN_THROW(miopenStatusBadParm, "requestAlgoCount cannot be < 1");
+ 
++    std::string find_config;
++
++    if(miopen::IsEnabled(MIOPEN_ENABLE_CACHE_CONV_CONFIG{}) && requestAlgoCount == 1)
++    {
++        mlo_construct_BwdWrW2D find_params(
++            xDesc, dwDesc, dyDesc, *this, 0); // backward with regards to weights
++        find_params.mloBuildConf_Key(find_config);
++
++        auto iter = handle.bwdWeights_map.find(find_config);
++        if(iter != handle.bwdWeights_map.end())
++        {
++            perfResults[0].bwd_weights_algo =
++                static_cast<miopenConvBwdWeightsAlgorithm_t>(iter->second);
++            *returnedAlgoCount = 1;
++            return;
++        }
++    }
++
+     *returnedAlgoCount = 0;
+ 
+     // create a dummy buffer for use as output for the kernel calls
+@@ -3890,6 +3949,9 @@ void ConvolutionDescriptor::FindConvBwdWeightsAlgorithm(Handle& handle,
+         perfResults[i].time   = perf_db[i].time;
+         perfResults[i].memory = perf_db[i].workspace;
+     }
++    if(miopen::IsEnabled(MIOPEN_ENABLE_CACHE_CONV_CONFIG{}))
++        handle.bwdWeights_map.insert(std::unordered_map<std::string, int>::value_type(
++            find_config, BwdWeightsAlgoResolver(perf_db[0].name)));
+ }
+ 
+ // BackwardWeightsAlgorithm()
+-- 
+2.7.4
+

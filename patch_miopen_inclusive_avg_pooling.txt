@@ -1,0 +1,355 @@
+diff --git a/driver/mloPoolingHost.hpp b/driver/mloPoolingHost.hpp
+index f68aa18..cb412e2 100644
+--- a/driver/mloPoolingHost.hpp
++++ b/driver/mloPoolingHost.hpp
+@@ -72,6 +72,7 @@ double CalcErr( _T c_val, _T g_val)
+ #define MLO_POOLING_OP_MAX 0
+ #define MLO_POOLING_OP_AVE 1
+ #define MLO_POOLING_OP_STC 2
++#define MLO_POOLING_OP_AVE_INCLUSIVE 3
+ #endif
+ 
+ template <typename _Tgpu /* the data type used in GPU computations (usually half) */,
+@@ -124,7 +125,8 @@ bool mloPoolingForwardRunHostAndVerify(int pooling_method,
+                     {
+                         res = -MAX_VAL;
+                     }
+-                    else if(pooling_method == MLO_POOLING_OP_AVE)
++                    else if(pooling_method == MLO_POOLING_OP_AVE ||
++                            pooling_method == MLO_POOLING_OP_AVE_INCLUSIVE)
+                     {
+                         res = static_cast<_Tcheck>(0);
+                     }
+@@ -136,7 +138,11 @@ bool mloPoolingForwardRunHostAndVerify(int pooling_method,
+                     hstart     = std::max(hstart, 0);
+                     wstart     = std::max(wstart, 0);
+ 
+-                    int pool_size        = (hend - hstart) * (wend - wstart);
++                    int pool_size;
++                    if(pooling_method == MLO_POOLING_OP_AVE)
++                        pool_size = (hend - hstart) * (wend - wstart);
++                    else
++                        pool_size        = kernel_size0 * kernel_size1;
+                     pool_size            = (pool_size == 0) ? 1 : pool_size;
+                     size_t res_index     = 0;
+                     size_t res_index_gpu = 0;
+@@ -158,7 +164,8 @@ bool mloPoolingForwardRunHostAndVerify(int pooling_method,
+                                     found = true;
+                                 }
+                             }
+-                            else if(pooling_method == MLO_POOLING_OP_AVE)
++                            else if(pooling_method == MLO_POOLING_OP_AVE ||
++                                    pooling_method == MLO_POOLING_OP_AVE_INCLUSIVE)
+                             {
+ 
+                                 res += static_cast<_Tcheck>(
+@@ -199,7 +206,8 @@ bool mloPoolingForwardRunHostAndVerify(int pooling_method,
+                             }
+                         }
+                     }
+-                    if(pooling_method == MLO_POOLING_OP_AVE)
++                    if(pooling_method == MLO_POOLING_OP_AVE ||
++                       pooling_method == MLO_POOLING_OP_AVE_INCLUSIVE)
+                     {
+                         res /= pool_size;
+                     }
+@@ -286,7 +294,8 @@ int mloPoolingBackwardRunHost(
+                     }
+                 }
+             }
+-            else if(pooling_method == MLO_POOLING_OP_AVE)
++            else if(pooling_method == MLO_POOLING_OP_AVE ||
++                    pooling_method == MLO_POOLING_OP_AVE_INCLUSIVE)
+             {
+ 
+                 for(int j = 0; j < bot_height; j++)
+@@ -315,9 +324,15 @@ int mloPoolingBackwardRunHost(
+                                 hstart     = std::max(hstart, 0);
+                                 wstart     = std::max(wstart, 0);
+ 
+-                                int pool_size = ((hend - hstart) * (wend - wstart) == 0)
++                                int pool_size;
++                                if(pooling_method == MLO_POOLING_OP_AVE)
++                                    pool_size = ((hend - hstart) * (wend - wstart) == 0)
+                                                     ? 1
+                                                     : (hend - hstart) * (wend - wstart);
++                                else
++                                    pool_size = (kernel_size0 * kernel_size1 == 0)
++                                                    ? 1
++                                                    : kernel_size0 * kernel_size1;
+                                 gradient += static_cast<_Tcheck>(
+                                                 top_df_ptr[top_df_off + ph * top_df_stride + pw]) /
+                                             static_cast<_Tcheck>(pool_size);
+diff --git a/driver/pool_driver.hpp b/driver/pool_driver.hpp
+index 9970094..709d7cb 100644
+--- a/driver/pool_driver.hpp
++++ b/driver/pool_driver.hpp
+@@ -168,7 +168,8 @@ int PoolDriver<Tgpu, Tref>::AddCmdLineArgs()
+     inflags.AddInputFlag(
+         "wall", 'w', "0", "Wall-clock Time Each Layer, Requires time == 1 (Default=0)", "int");
+     inflags.AddInputFlag("print", 'P', "1", "Print Pooling Dimensions (Default=1)", "int");
+-    inflags.AddInputFlag("mode", 'm', "max", "Pooling Mode (max, avg) (Default=max)", "str");
++    inflags.AddInputFlag(
++        "mode", 'm', "max", "Pooling Mode (max, avg, avg_in) (Default=max)", "str");
+     inflags.AddInputFlag(
+         "pad_mode", 'z', "default", "Padding Mode (same, valid, default) (Default=default)", "str");
+ 
+@@ -208,6 +209,11 @@ int PoolDriver<Tgpu, Tref>::SetPoolDescriptorFromCmdLineArgs()
+         mode  = miopenPoolingAverage;
+         pmode = miopenPaddingDefault;
+     }
++    else if((inflags.GetValueStr("mode")) == "avg_in")
++    {
++        mode  = miopenPoolingAverageInclusive;
++        pmode = miopenPaddingDefault;
++    }
+     else
+     {
+         printf("Incorrect Pooling Mode\n");
+@@ -474,7 +480,10 @@ int PoolDriver<Tgpu, Tref>::VerifyForward()
+     if(hOut <= 0 || wOut <= 0)
+         throw std::runtime_error("Invalid Test Case: Check Output Dimension.");
+ 
+-    int pooling_method = (mode == miopenPoolingMax) ? MLO_POOLING_OP_MAX : MLO_POOLING_OP_AVE;
++    int pooling_method =
++        (mode == miopenPoolingMax)
++            ? MLO_POOLING_OP_MAX
++            : ((mode == miopenPoolingAverage) ? MLO_POOLING_OP_AVE : MLO_POOLING_OP_AVE_INCLUSIVE);
+ 
+     const Tref tolerance = (sizeof(Tgpu) == 4 || sizeof(Tgpu) == 8) ? 1e-6 : 1e-3;
+     bool match           = mloPoolingForwardRunHostAndVerify<Tgpu, Tref>(pooling_method,
+@@ -564,7 +573,10 @@ int PoolDriver<Tgpu, Tref>::VerifyBackward()
+         pad_h = 0;
+         pad_w = 0;
+     }
+-    int pooling_method = (mode == miopenPoolingMax) ? MLO_POOLING_OP_MAX : MLO_POOLING_OP_AVE;
++    int pooling_method =
++        (mode == miopenPoolingMax)
++            ? MLO_POOLING_OP_MAX
++            : ((mode == miopenPoolingAverage) ? MLO_POOLING_OP_AVE : MLO_POOLING_OP_AVE_INCLUSIVE);
+ 
+     mloPoolingBackwardRunHost<Tgpu, Tref>(pooling_method,
+                                           windowHeight,
+diff --git a/include/miopen/miopen.h b/include/miopen/miopen.h
+index ddefa61..9ad9acd 100644
+--- a/include/miopen/miopen.h
++++ b/include/miopen/miopen.h
+@@ -335,8 +335,9 @@ typedef enum {
+  * Pooling layer mode
+ */
+ typedef enum {
+-    miopenPoolingMax     = 0, /*!< Maximum pooling */
+-    miopenPoolingAverage = 1, /*!< Average pooling */
++    miopenPoolingMax              = 0, /*!< Maximum pooling */
++    miopenPoolingAverage          = 1, /*!< Average pooling */
++    miopenPoolingAverageInclusive = 2, /*!< Inclusive Average pooling */
+ } miopenPoolingMode_t;
+ 
+ /*! @ingroup LRN
+diff --git a/src/include/miopen/mlo_internal.hpp b/src/include/miopen/mlo_internal.hpp
+index 09b0701..14b14df 100644
+--- a/src/include/miopen/mlo_internal.hpp
++++ b/src/include/miopen/mlo_internal.hpp
+@@ -735,6 +735,7 @@ struct mlo_construct_winograd : mlo_construct_direct2D
+ #define MLO_POOLING_OP_AVE 0
+ #define MLO_POOLING_OP_MAX 1
+ #define MLO_POOLING_OP_STC 2
++#define MLO_POOLING_OP_AVE_INCLUSIVE 3
+ 
+ struct mlo_construct_pooling2D : mlo_construct_direct2D, mlo_construct_activ_lrn_pooling_common
+ {
+diff --git a/src/kernels/MIOpenPooling.cl b/src/kernels/MIOpenPooling.cl
+index 5d0118d..249c792 100644
+--- a/src/kernels/MIOpenPooling.cl
++++ b/src/kernels/MIOpenPooling.cl
+@@ -58,6 +58,7 @@
+ #define MLO_POOLING_OP_AVE 0
+ #define MLO_POOLING_OP_MAX 1
+ #define MLO_POOLING_OP_STC 2
++#define MLO_POOLING_OP_AVE_INCLUSIVE 3
+ 
+ #define MLO_POOLING_GROUP_SZ2 1
+ 
+@@ -67,7 +68,8 @@
+ // max
+ #if MLO_POOLING_OP_ID == MLO_POOLING_OP_MAX
+ #define MLO_POOLING_OP(A, B) fmax(A, B);
+-#elif MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE
++#elif(MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE) || \
++    (MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE_INCLUSIVE)
+ #define MLO_POOLING_OP(A, B) (A + B);
+ #endif
+ 
+@@ -114,7 +116,8 @@ mloPoolingG(const __global _FLOAT* bot,
+         {
+ #if MLO_POOLING_OP_ID == MLO_POOLING_OP_MAX
+             res[k][l] = (_FLOAT)(-MAX_VAL);
+-#elif MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE
++#elif(MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE) || \
++    (MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE_INCLUSIVE)
+             res[k][l] = (_FLOAT)(0);
+ #endif
+         }
+@@ -135,7 +138,8 @@ mloPoolingG(const __global _FLOAT* bot,
+             bot_data[j][i] = (vis) ? bot[bot_gbl_off] :
+ #if MLO_POOLING_OP_ID == MLO_POOLING_OP_MAX
+                                    (_FLOAT)(-MAX_VAL)
+-#elif MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE
++#elif(MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE) || \
++    (MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE_INCLUSIVE)
+                                    (_FLOAT)(0)
+ #endif
+                 ;
+@@ -145,7 +149,7 @@ mloPoolingG(const __global _FLOAT* bot,
+ #pragma unroll
+     for(uint k = 0; k < MLO_POOLING_N_VERT_OUT_PIX; k++)
+     {
+-#if MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE
++#if(MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE) || (MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE_INCLUSIVE)
+         uint y_dst = y + lcl_id1 * MLO_POOLING_N_VERT_OUT_PIX + k;
+         int hstart = (int)y_dst * MLO_POOLING_STRIDE1 - MLO_POOLING_PAD1;
+         int hend   = min((hstart + MLO_POOLING_KERNEL_SZ1), (int)(MLO_POOLING_BOT_HEIGHT));
+@@ -154,13 +158,17 @@ mloPoolingG(const __global _FLOAT* bot,
+         for(uint l = 0; l < MLO_POOLING_N_HORIZ_OUT_PIX; l++)
+         {
+ 
+-#if MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE
++#if(MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE) || (MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE_INCLUSIVE)
+             uint x_dst     = x + lcl_id0 * MLO_POOLING_N_HORIZ_OUT_PIX + l;
+             int wstart     = (int)x_dst * MLO_POOLING_STRIDE0 - MLO_POOLING_PAD0;
+             int wend       = min((wstart + MLO_POOLING_KERNEL_SZ0), (int)(MLO_POOLING_BOT_WIDTH));
+             wstart         = max(wstart, 0);
+             uint pool_size = (hend - hstart) * (wend - wstart);
+-            pool_size      = (pool_size == 0) ? 1 : pool_size;
++#if MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE_INCLUSIVE
++            pool_size = (pool_size == 0) ? 1 : MLO_POOLING_KERNEL_SZ0 * MLO_POOLING_KERNEL_SZ1;
++#else
++            pool_size = (pool_size == 0) ? 1 : pool_size;
++#endif
+ #endif
+ #if defined(MLO_POOLING_DO_BACKWARD) && MLO_POOLING_OP_ID == MLO_POOLING_OP_MAX
+             mask_private[k][l] = 0xFF;
+@@ -186,7 +194,7 @@ mloPoolingG(const __global _FLOAT* bot,
+                 }
+             }
+ 
+-#if MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE
++#if(MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE) || (MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE_INCLUSIVE)
+             res[k][l] *= (_FLOAT)1.f / (_FLOAT)pool_size;
+ #endif
+         }
+diff --git a/src/kernels/MIOpenPoolingBwd.cl b/src/kernels/MIOpenPoolingBwd.cl
+index 8e4488a..d232953 100644
+--- a/src/kernels/MIOpenPoolingBwd.cl
++++ b/src/kernels/MIOpenPoolingBwd.cl
+@@ -56,6 +56,11 @@
+ #define MLO_POOLING_OP_AVE 0
+ #define MLO_POOLING_OP_MAX 1
+ #define MLO_POOLING_OP_STC 2
++#define MLO_POOLING_OP_AVE_INCLUSIVE 3
++
++#ifndef MLO_POOLING_OP_ID
++#define MLO_POOLING_OP_ID 0
++#endif
+ 
+ #define MLO_POOLBWD_GROUP_SZ2 1
+ 
+@@ -166,10 +171,14 @@ mloPoolingAveBwd(const __global _FLOAT* top_diff, __global _FLOAT* bot_diff)
+                 for(int top_w = top_wstart; top_w < top_wend; ++top_w)
+                 {
+                     // figure out the pooling size
+-                    int wstart    = top_w * MLO_POOLING_STRIDE0 - MLO_POOLING_PAD0;
+-                    int wend      = min(wstart + MLO_POOLING_KERNEL_SZ0, MLO_POOLBWD_BOT_WIDTH);
+-                    wstart        = max(wstart, 0);
++                    int wstart = top_w * MLO_POOLING_STRIDE0 - MLO_POOLING_PAD0;
++                    int wend   = min(wstart + MLO_POOLING_KERNEL_SZ0, MLO_POOLBWD_BOT_WIDTH);
++                    wstart     = max(wstart, 0);
++#if MLO_POOLING_OP_ID == MLO_POOLING_OP_AVE_INCLUSIVE
++                    int pool_size = MLO_POOLING_KERNEL_SZ0 * MLO_POOLING_KERNEL_SZ1;
++#else
+                     int pool_size = (hend - hstart) * (wend - wstart);
++#endif
+                     pool_size     = (pool_size == 0) ? 1 : pool_size;
+                     int lcl_top_h = top_h - top_y;
+                     int lcl_top_w = top_w - top_x;
+diff --git a/src/ocl/mloPooling.cpp b/src/ocl/mloPooling.cpp
+index 8cc2d41..640bec7 100644
+--- a/src/ocl/mloPooling.cpp
++++ b/src/ocl/mloPooling.cpp
+@@ -172,7 +172,9 @@ int mlo_construct_pooling2D::mloConstructBwd()
+     _out_pix_tile0 = (_search_params.out_width < _grp_tile0 * 2) ? 1 : 2;
+     _out_pix_tile1 = (_search_params.out_height < _grp_tile1 * 2) ? 1 : 2;
+ 
+-    _comp_options = std::string(" -DMLO_POOLING_KERNEL_SZ1=") +
++    _comp_options = std::string(" -DMLO_POOLING_OP_ID=") +
++                    std::to_string(static_cast<long long>(_pooling_method)) +
++                    std::string(" -DMLO_POOLING_KERNEL_SZ1=") +
+                     std::to_string(static_cast<long long>(_search_params.kernel_size1)) +
+                     std::string(" -DMLO_POOLING_PAD1=") +
+                     std::to_string(static_cast<long long>(_search_params.pad1)) +
+@@ -237,7 +239,8 @@ int mlo_construct_pooling2D::mloConstructBwd()
+     {
+         _kernel_name = "mloPoolingMaxBwd";
+     }
+-    else if(_pooling_method == MLO_POOLING_OP_AVE)
++    else if(_pooling_method == MLO_POOLING_OP_AVE ||
++            _pooling_method == MLO_POOLING_OP_AVE_INCLUSIVE)
+     {
+         _kernel_name = "mloPoolingAveBwd";
+     }
+diff --git a/src/ocl/pooling_ocl.cpp b/src/ocl/pooling_ocl.cpp
+index 9d7f3e0..582ce17 100644
+--- a/src/ocl/pooling_ocl.cpp
++++ b/src/ocl/pooling_ocl.cpp
+@@ -104,7 +104,10 @@ miopenStatus_t PoolingDescriptor::Forward(Handle& handle,
+         throw std::invalid_argument(
+             "workSpace cannot be NULL in Forward Pooling MAX mode when backward pass is requested");
+     }
+-    int pooling_method = (mode == miopenPoolingMax) ? MLO_POOLING_OP_MAX : MLO_POOLING_OP_AVE;
++    int pooling_method =
++        (mode == miopenPoolingMax)
++            ? MLO_POOLING_OP_MAX
++            : ((mode == miopenPoolingAverage) ? MLO_POOLING_OP_AVE : MLO_POOLING_OP_AVE_INCLUSIVE);
+     construct_params.setPoolingDescr(
+         pooling_method, lens[0], lens[1], pads[0], pads[1], strides[0], strides[1]);
+ 
+@@ -247,7 +250,10 @@ miopenStatus_t PoolingDescriptor::Backward(Handle& handle,
+     {
+         throw std::invalid_argument("workSpace cannot be NULL in Backward Pooling MAX mode");
+     }
+-    int pooling_method = (mode == miopenPoolingMax) ? MLO_POOLING_OP_MAX : MLO_POOLING_OP_AVE;
++    int pooling_method =
++        (mode == miopenPoolingMax)
++            ? MLO_POOLING_OP_MAX
++            : ((mode == miopenPoolingAverage) ? MLO_POOLING_OP_AVE : MLO_POOLING_OP_AVE_INCLUSIVE);
+     construct_params.setPoolingDescr(
+         pooling_method, lens[0], lens[1], pads[0], pads[1], strides[0], strides[1]);
+ 
+diff --git a/src/pooling_api.cpp b/src/pooling_api.cpp
+index b6642df..bcc44a5 100644
+--- a/src/pooling_api.cpp
++++ b/src/pooling_api.cpp
+@@ -205,7 +205,10 @@ extern "C" miopenStatus_t miopenPoolingForward(miopenHandle_t handle,
+                   << " -p " << miopen::deref(poolDesc).pads[0] << " -q "
+                   << miopen::deref(poolDesc).pads[1] << " -u " << miopen::deref(poolDesc).strides[0]
+                   << " -v " << miopen::deref(poolDesc).strides[1] << " -m "
+-                  << (miopen::deref(poolDesc).mode == 1 ? "avg" : "max") << " -t "
++                  << (miopen::deref(poolDesc).mode == 0
++                          ? "max"
++                          : (miopen::deref(poolDesc).mode == 1 ? "avg" : "avg_in"))
++                  << " -t "
+                   << "1"
+                   << "\n";
+     }
+@@ -264,7 +267,10 @@ extern "C" miopenStatus_t miopenPoolingBackward(miopenHandle_t handle,
+                   << " -p " << miopen::deref(poolDesc).pads[0] << " -q "
+                   << miopen::deref(poolDesc).pads[1] << " -u " << miopen::deref(poolDesc).strides[0]
+                   << " -v " << miopen::deref(poolDesc).strides[1] << " -m "
+-                  << (miopen::deref(poolDesc).mode == 1 ? "avg" : "max") << " -t "
++                  << (miopen::deref(poolDesc).mode == 0
++                          ? "max"
++                          : (miopen::deref(poolDesc).mode == 1 ? "avg" : "avg_in"))
++                  << " -t "
+                   << "1"
+                   << "\n";
+     }
