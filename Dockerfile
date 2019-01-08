@@ -85,7 +85,7 @@ RUN mkdir -p /opt/rocm/include && cd /opt/rocm/include && wget https://github.co
 RUN cd ~ && git clone https://github.com/RadeonOpenCompute/rocm-cmake.git && cd ~/rocm-cmake && \
     mkdir -p build && cd build && cmake .. && cmake --build . --target install
 
-COPY rocm9_115/repo /var/lib/rocm/repo
+COPY rocm0_1220/repo /var/lib/rocm/repo
 
 RUN echo "[ROCm]" > /etc/yum.repos.d/rocm.repo
 RUN echo "name=ROCm" >> /etc/yum.repos.d/rocm.repo
@@ -94,7 +94,7 @@ RUN echo "enabled=1" >> /etc/yum.repos.d/rocm.repo
 RUN echo "gpgcheck=0" >> /etc/yum.repos.d/rocm.repo
 
 RUN yum install --disablerepo=/* --enablerepo=ROCm --nogpgcheck -y hsa-ext-rocr-dev hsakmt-roct-dev hsa-rocr-dev rocm-opencl rocm-opencl-devel rocm-utils \
-    miopengemm rocblas hipblas miopen-hip rocrand  cxlactivitylogger Thrust && \
+    miopengemm rocblas hipblas miopen-hip rocrand  cxlactivitylogger Thrust rccl && \
     yum clean packages
 
 RUN echo "export MIOPEN_ENABLE_CACHE_CONV_CONFIG=1" >> ~/.bashrc
@@ -106,29 +106,34 @@ RUN ln -s /opt/rocm/hip/include/hip /opt/rocm/include/hip
 
 RUN echo gfx900\ngfx906 > /opt/rocm/bin/target.lst
 
-RUN cd ~ && git clone https://github.com/ROCmSoftwarePlatform/rccl.git
+#RUN cd ~ && git clone https://github.com/ROCmSoftwarePlatform/rccl.git
 
-RUN cd /root/rccl/ && \
-    cd src && PATH=/opt/rh/devtoolset-7/root/usr/bin${PATH:+:${PATH}} \
-    make && make install 
+#RUN cd /root/rccl/ && \
+#    cd src && PATH=/opt/rh/devtoolset-7/root/usr/bin${PATH:+:${PATH}} \
+#    make && make install 
 #&& cp /opt/rocm/rccl/include/rccl/rccl.h /opt/rocm/rccl/include/
 
-COPY patch_conv_cache.txt /root
+COPY 0001-Cache.patch /root
+COPY patch_miopen_inclusive_avg_pooling.txt /root
+#COPY patch_conv_cache.txt /root
 #COPY 0001-Add-cache.patch /root
 #COPY 0002-Add-group-conv-support.patch /root
 
-ARG user
-ARG pwd
-RUN cd ~/ && git clone https://${user}:${pwd}@github.com/AMDComputeLibraries/MLOpen -b 1.6.x && cd ~/MLOpen && \
-    git apply ../patch_conv_cache.txt && \
+RUN cd ~/ && git clone https://sabreshao:Emacs_98@github.com/AMDComputeLibraries/MLOpen -b 1.7.x && cd ~/MLOpen && \
+    git apply ../0001-Cache.patch && git apply ../patch_miopen_inclusive_avg_pooling.txt && \
     mkdir -p build && cd build && \
     PATH=/opt/rh/devtoolset-7/root/usr/bin${PATH:+:${PATH}} CXX=/opt/rocm/hcc/bin/hcc cmake \
     -DMIOPEN_BACKEND=HIP -DCMAKE_PREFIX_PATH="/opt/rocm/hcc;/opt/rocm/hip" -DCMAKE_CXX_FLAGS="-isystem /usr/include/x86_64-linux-gnu/" -DBoost_INCLUDE_DIR=/usr/local/include -DBoost_LIBRARY_DIR_RELEASE=/usr/local/lib64 .. && \
     PATH=/opt/rh/devtoolset-7/root/usr/bin${PATH:+:${PATH}} make -j && make package && \
     rpm -Uvh --force MIOpen-HIP-*.rpm && cd ~ && rm -rf ~/MLOpen/build
 RUN mkdir -p /root/.config && mkdir -p /root/.config/miopen
-COPY gfx906_64.cd.updb.txt /root/.config/miopen/
-COPY gfx900_64.cd.updb.txt /root/.config/miopen/
+#COPY gfx906_64.cd.updb.txt /root/.config/miopen/
+#COPY gfx900_64.cd.updb.txt /root/.config/miopen/
+
+RUN cd ~/ && git clone https://github.com/ROCmSoftwarePlatform/hipBLAS -b develop && cd ~/hipBLAS && \
+    mkdir -p build && cd build && mkdir -p release && cd release && \
+    CXX=/opt/rocm/bin/hcc cmake ../.. && make -j && make package && \
+    rpm -Uvh --force hipblas-*.rpm && cd ~ && rm -rf ~/hipBLAS/build
 
 RUN rm /opt/rocm/bin/target.lst
 
