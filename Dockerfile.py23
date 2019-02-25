@@ -1,0 +1,73 @@
+# | This Dockerfile provides a starting point for a ROCm installation of hipCaffe.
+#FROM sabreshao/paddle_manylinux_devel_centos7:latest
+#FROM centos:7.4.1708
+FROM sabreshao/paddle_rocm:py2_py3_test_01
+MAINTAINER Sabre Shao <sabre.shao@amd.com>
+
+RUN yum install -y lapack-devel lapack bc bridge-utils protobuf-compiler protobuf-devel leveldb-devel snappy-devel hdf5-devel atlas-devel glog-devel snappy-devel patchelf rpm-build
+RUN cd /root && wget http://sourceforge.net/projects/boost/files/boost/1.58.0/boost_1_58_0.tar.bz2
+RUN cd /root && tar xvjf /root/boost_1_58_0.tar.bz2 
+RUN cd /root/boost_1_58_0 && ./bootstrap.sh --without-libraries=python --prefix=/usr/local && ./b2 install && \
+    cd /root && rm -rf /root/boost_1_58_0 && rm /root/boost_1_58_0.tar.bz2
+
+RUN echo "export PATH=/opt/rh/devtoolset-7/root/usr/bin${PATH:+:${PATH}}" >> ~/.bashrc
+RUN echo "export MANPATH=/opt/rh/devtoolset-7/root/usr/share/man:${MANPATH} " >> ~/.bashrc
+RUN echo "export INFOPATH=/opt/rh/devtoolset-7/root/usr/share/info${INFOPATH:+:${INFOPATH}} " >> ~/.bashrc
+RUN echo "export PCP_DIR=/opt/rh/devtoolset-7/root " >> ~/.bashrc
+RUN echo "export PERL5LIB=/opt/rh/devtoolset-7/root//usr/lib64/perl5/vendor_perl:/opt/rh/devtoolset-7/root/usr/lib/perl5:/opt/rh/devtoolset-7/root//usr/share/perl5/ " >> ~/.bashrc
+RUN echo "export LD_LIBRARY_PATH=/opt/rh/devtoolset-7/root$rpmlibdir$rpmlibdir32${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}} " >> ~/.bashrc
+RUN echo "export PYTHONPATH=/opt/rh/devtoolset-7/root/usr/lib64/python$pythonvers/site-packages:/opt/rh/devtoolset-7/root/usr/lib/python$pythonvers/" >> ~/.bashrc
+RUN echo "export LDFLAGS=\"-Wl,-rpath=/opt/rh/devtoolset-7/root/usr/lib64 -Wl,-rpath=/opt/rh/devtoolset-7/root/usr/lib\" " >> ~/.bashrc
+
+RUN mkdir -p /opt/rocm/include && cd /opt/rocm/include && wget https://github.com/Melown/half/raw/master/half/half.hpp
+
+RUN cd ~ && git clone https://github.com/RadeonOpenCompute/rocm-cmake.git && cd ~/rocm-cmake && \
+    mkdir -p build && cd build && cmake .. && cmake --build . --target install
+
+COPY rocm1_0202/repo /var/lib/rocm/repo
+
+RUN echo "[ROCm]" > /etc/yum.repos.d/rocm.repo
+RUN echo "name=ROCm" >> /etc/yum.repos.d/rocm.repo
+RUN echo "baseurl=file:///var/lib/rocm/repo" >> /etc/yum.repos.d/rocm.repo
+RUN echo "enabled=1" >> /etc/yum.repos.d/rocm.repo
+RUN echo "gpgcheck=0" >> /etc/yum.repos.d/rocm.repo
+
+RUN yum install --disablerepo=/* --enablerepo=ROCm --nogpgcheck -y hsa-ext-rocr-dev hsakmt-roct-dev hsa-rocr-dev rocm-opencl rocm-opencl-devel rocm-utils \
+    miopengemm rocblas hipblas miopen-hip rocrand  cxlactivitylogger Thrust rccl && \
+    yum clean packages
+
+RUN echo "export MIOPEN_ENABLE_CACHE_CONV_CONFIG=1" >> ~/.bashrc
+RUN echo "export LD_LIBRARY_PATH=/paddle/build/third_party/mkldnn/src/extern_mkldnn-build/src:/paddle/build/third_party/install/mklml/lib:/opt/rocm/lib:/opt/rocm/rccl/lib:/opt/rocm/hiprand/lib:/opt/rocm/rocrand/lib:/usr/lib:/usr/local/lib:/opt/rocm/hip/lib" >> ~/.bashrc
+
+RUN ln -s /opt/rocm/lib /opt/rocm/lib64
+RUN ln -s /opt/rocm/hip/include/hip /opt/rocm/include/hip
+
+RUN echo gfx900\ngfx906 > /opt/rocm/bin/target.lst
+
+#RUN cd ~ && git clone https://github.com/ROCmSoftwarePlatform/rccl.git
+
+#RUN cd /root/rccl/ && \
+#    cd src && PATH=/opt/rh/devtoolset-7/root/usr/bin${PATH:+:${PATH}} \
+#    make && make install 
+#&& cp /opt/rocm/rccl/include/rccl/rccl.h /opt/rocm/rccl/include/
+
+COPY 0001-Cache.patch /root
+COPY patch_miopen_inclusive_avg_pooling.txt /root
+COPY Mlopen_cmakelists.patch /root 
+
+RUN cd ~/ && git clone https://github.com/carlushuang/hipBLAS.git -b support_hgemm_strided_batched && cd ~/hipBLAS && \
+    mkdir -p build && cd build && mkdir -p release && cd release && \
+    CXX=/opt/rocm/bin/hcc cmake ../.. && make -j && make package && \
+    rpm -Uvh --force hipblas-*.rpm && cd ~ && rm -rf ~/hipBLAS/build
+
+ARG user
+ARG pwd
+RUN cd ~/ && git clone https://${user}:${pwd}@github.com/AMDComputeLibraries/MLOpen -b 1.7.x && cd ~/MLOpen && \
+    git apply ../0001-Cache.patch && git apply ../patch_miopen_inclusive_avg_pooling.txt && \
+    git apply ../Mlopen_cmakelists.patch && mkdir -p build && cd build && \
+    PATH=/opt/rh/devtoolset-7/root/usr/bin${PATH:+:${PATH}} CXX=/opt/rocm/hcc/bin/hcc cmake \
+    -DMIOPEN_BACKEND=HIP -DCMAKE_PREFIX_PATH="/opt/rocm/hcc;/opt/rocm/hip" -DCMAKE_CXX_FLAGS="-isystem /usr/include/x86_64-linux-gnu/" -DBoost_INCLUDE_DIR=/usr/local/include -DBoost_LIBRARY_DIR_RELEASE=/usr/local/lib64 .. && \
+    PATH=/opt/rh/devtoolset-7/root/usr/bin${PATH:+:${PATH}} make -j && make package && \
+    rpm -Uvh --force MIOpen-HIP-*.rpm && cd ~ && rm -rf ~/MLOpen/build
+
+RUN rm /opt/rocm/bin/target.lst
